@@ -1950,6 +1950,131 @@ app.put(
   })
 );
 
+// ── Admin Loan Pause / Unpause ─────────────────────────────────────────────────
+
+const pauseLoanSchema = z.object({
+  reason: z.string().min(1, 'reason is required').max(500, 'reason must be at most 500 characters'),
+});
+
+/**
+ * POST /api/v1/admin/loans/:id/pause — pause an active loan (admin only).
+ *
+ * Creates an immutable audit log entry capturing the admin user ID, action
+ * type, reason, and timestamp. The loan status transitions to "paused".
+ *
+ * closes #1242
+ */
+app.post(
+  '/api/v1/admin/loans/:id/pause',
+  timeoutMiddleware(parseInt(config.TIMEOUT_WRITE_MS, 10)),
+  writeLimiter,
+  asyncHandler(async (req: Request, res: Response) => {
+    const user = (req as any).user as { publicKey?: string; role?: string } | undefined;
+    if (!user || user.role !== 'admin') {
+      return res.status(403).json({ error: 'Forbidden: admin role required' });
+    }
+
+    const validation = pauseLoanSchema.safeParse(req.body);
+    if (!validation.success) {
+      return res.status(400).json({ error: 'Validation failed', details: validation.error.issues });
+    }
+
+    const { reason } = validation.data;
+    const loanId = req.params.id as string;
+    const loan = getLoan(loanId);
+
+    if (!loan) {
+      return res.status(404).json({ error: 'Loan not found' });
+    }
+    if (loan.status === 'paused') {
+      return res.status(409).json({ error: 'Loan is already paused' });
+    }
+    if (loan.status === 'repaid' || loan.status === 'liquidated') {
+      return res.status(409).json({ error: `Cannot pause a ${loan.status} loan` });
+    }
+
+    const updated = updateLoan(loanId, { status: 'paused' });
+
+    // Immutable audit entry — cannot be deleted or modified (closes #1242)
+    insertAuditEntry({
+      userId: user.publicKey ?? 'unknown',
+      action: 'loan.paused',
+      resource: 'loan',
+      resourceId: loanId,
+      requestBody: { reason },
+      ip: req.ip,
+    });
+
+    auditLogger.info('loan.paused', {
+      requestId: (req as any).requestId,
+      loanId,
+      adminId: user.publicKey,
+      reason,
+    });
+
+    invalidateCache('/api/loans');
+    res.json({ paused: true, loanId, reason, timestamp: new Date().toISOString(), loan: updated });
+  })
+);
+
+/**
+ * POST /api/v1/admin/loans/:id/unpause — resume a paused loan (admin only).
+ *
+ * Creates an immutable audit log entry and transitions the loan back to
+ * "active" status.
+ *
+ * closes #1242
+ */
+app.post(
+  '/api/v1/admin/loans/:id/unpause',
+  timeoutMiddleware(parseInt(config.TIMEOUT_WRITE_MS, 10)),
+  writeLimiter,
+  asyncHandler(async (req: Request, res: Response) => {
+    const user = (req as any).user as { publicKey?: string; role?: string } | undefined;
+    if (!user || user.role !== 'admin') {
+      return res.status(403).json({ error: 'Forbidden: admin role required' });
+    }
+
+    const validation = pauseLoanSchema.safeParse(req.body);
+    if (!validation.success) {
+      return res.status(400).json({ error: 'Validation failed', details: validation.error.issues });
+    }
+
+    const { reason } = validation.data;
+    const loanId = req.params.id as string;
+    const loan = getLoan(loanId);
+
+    if (!loan) {
+      return res.status(404).json({ error: 'Loan not found' });
+    }
+    if (loan.status !== 'paused') {
+      return res.status(409).json({ error: 'Loan is not paused' });
+    }
+
+    const updated = updateLoan(loanId, { status: 'active' });
+
+    // Immutable audit entry — cannot be deleted or modified (closes #1242)
+    insertAuditEntry({
+      userId: user.publicKey ?? 'unknown',
+      action: 'loan.unpaused',
+      resource: 'loan',
+      resourceId: loanId,
+      requestBody: { reason },
+      ip: req.ip,
+    });
+
+    auditLogger.info('loan.unpaused', {
+      requestId: (req as any).requestId,
+      loanId,
+      adminId: user.publicKey,
+      reason,
+    });
+
+    invalidateCache('/api/loans');
+    res.json({ unpaused: true, loanId, reason, timestamp: new Date().toISOString(), loan: updated });
+  })
+);
+
 // ── User Profile ──────────────────────────────────────────────────────────────
 
 /**
